@@ -4,27 +4,32 @@ React + Vite frontend for agent-docs — viewer chrome only.
 Separate repo — it talks to the api repo over HTTP and never
 imports api, mcp, or cli code.
 
-## Scope — publish, view, and version history only
+## Scope — publish, view, version history, and shared state
 
 Screens:
 
 - Document list
 - Document viewer
 - Version picker (latest by default; any older version viewable)
+- Document state panel (view/set/delete shared state keys)
 
-No comments, reactions, mentions, notifications, shared state,
-grants UI, or approvals UI.
+No comments, reactions, mentions, notifications, grants UI,
+or approvals UI.
 
 ## The one rule this UI must never break
 
-Document HTML is rendered only in a sandboxed iframe whose `src`
-is the api repo's raw-HTML endpoint
-(`/v1/documents/{id}/versions/{version_id}/html`). This app never
-uses `dangerouslySetInnerHTML` and never parses document HTML.
-In production the API/render origin differs from this UI origin,
-so document code cannot reach the app's origin. The iframe uses
+Document HTML is rendered only in a sandboxed iframe. This app
+never uses `dangerouslySetInnerHTML` and never parses document
+HTML. The stored version is never changed: the viewer fetches
+the api repo's raw HTML, then renders a copy with a bridge
+script added at render time only. That bridge exposes
+`window.agentdocs.kv` (plus `window.slashdocs.kv`) to document
+JavaScript, talking to this chrome by postMessage, which calls
+the api repo's `/state` endpoints. The iframe uses
 `sandbox="allow-scripts"` only — `allow-same-origin` is
-deliberately not set.
+deliberately not set, so document code cannot reach the app's
+origin. In production the API/render origin differs from this
+UI origin.
 
 The components in `src/` are plain React placeholders. Swap them
 for the approved component library later; no approved library
