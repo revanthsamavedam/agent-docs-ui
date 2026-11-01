@@ -3,8 +3,13 @@ import React, { useEffect, useRef, useState } from "react";
 // Viewer chrome only. Document HTML is NEVER rendered by React:
 // it is loaded in a sandboxed iframe. The stored HTML is never
 // changed — the viewer only wraps it at render time with a
-// bridge script that exposes window.agentdocs.kv and
-// window.agentdocs.apiFetch via postMessage to this chrome.
+// bridge script that exposes window.agentdocs.kv,
+// window.agentdocs.apiFetch, and window.agentdocs.navigate
+// via postMessage to this chrome. Navigation: the chrome
+// renders a nav bar over the document list, documents link
+// to each other with window.agentdocs.navigate(docId) or
+// <a data-agentdocs-doc="doc_...">, and ?doc=<id> deep-links
+// a page. State stays document-scoped across navigation.
 // kv calls the api repo's state endpoints; apiFetch resolves a
 // registered internal API (or an author-provided token URL, if
 // its origin is trusted), fetches that endpoint's token with
@@ -130,6 +135,20 @@ const BRIDGE_SCRIPT = `
       );
     });
   }
+  function navigate(docId) {
+    // navigate("doc_...") — ask the viewer chrome to switch pages.
+    // A plain <a href> inside the sandboxed iframe would navigate
+    // the iframe itself and lose the chrome, so navigation goes
+    // through this bridge, same pattern as kv and apiFetch.
+    window.parent.postMessage({ type: "agentdocs-navigate", docId: docId }, "*");
+  }
+  document.addEventListener("click", function (e) {
+    var a = e.target && e.target.closest ? e.target.closest("a[data-agentdocs-doc]") : null;
+    if (a) {
+      e.preventDefault();
+      navigate(a.getAttribute("data-agentdocs-doc"));
+    }
+  });
   var kv = {
     get: function (key) { return call("get", key); },
     all: function () { return call("all"); },
@@ -137,7 +156,7 @@ const BRIDGE_SCRIPT = `
     delete: function (key) { return call("delete", key); },
     patch: function (patch) { return call("patch", null, null, patch); },
   };
-  window.agentdocs = { kv: kv, apiFetch: apiFetch };
+  window.agentdocs = { kv: kv, apiFetch: apiFetch, navigate: navigate };
   window.slashdocs = { kv: kv };
 })();
 `;
@@ -163,11 +182,22 @@ export default function App() {
   const [apis, setApis] = useState([]);
   const iframeRef = useRef(null);
   const apisRef = useRef([]);
+  const documentsRef = useRef([]);
   const tokenCacheRef = useRef(new Map());
 
   useEffect(() => {
     api("/v1/documents")
-      .then((data) => setDocuments(data.documents || []))
+      .then((data) => {
+        const docs = data.documents || [];
+        setDocuments(docs);
+        documentsRef.current = docs;
+        // Deep-link: ?doc=<id> opens that page on load, so nav
+        // links are shareable and bookmarkable.
+        const wanted = new URLSearchParams(window.location.search).get("doc");
+        if (wanted && docs.some((d) => d.id === wanted)) {
+          openDocument(wanted);
+        }
+      })
       .catch((e) => setError(String(e)));
     api("/v1/apis")
       .then((data) => {
@@ -189,6 +219,11 @@ export default function App() {
   async function openDocument(docId) {
     setError("");
     setSelectedId(docId);
+    try {
+      window.history.replaceState(null, "", `?doc=${encodeURIComponent(docId)}`);
+    } catch {
+      // Non-browser / restricted contexts: URL sync is best-effort.
+    }
     try {
       const data = await api(`/v1/documents/${docId}/versions`);
       setVersions(data.versions || []);
@@ -307,6 +342,23 @@ export default function App() {
     return { status: res.status, data };
   }
 
+  // Navigate bridge: document -> chrome -> switch document.
+  // Only a document id already in the viewer's list is honoured;
+  // an unknown id is ignored, never fetched blindly.
+  useEffect(() => {
+    function onNavigateMessage(e) {
+      const frame = iframeRef.current;
+      if (!frame || e.source !== frame.contentWindow) return;
+      const d = e.data || {};
+      if (d.type !== "agentdocs-navigate") return;
+      if (documentsRef.current.some((doc) => doc.id === d.docId)) {
+        openDocument(d.docId);
+      }
+    }
+    window.addEventListener("message", onNavigateMessage);
+    return () => window.removeEventListener("message", onNavigateMessage);
+  }, []);
+
   useEffect(() => {
     async function onApiMessage(e) {
       const frame = iframeRef.current;
@@ -362,6 +414,19 @@ export default function App() {
         )}
       </aside>
       <main className="viewer">
+        {documents.length > 0 && (
+          <nav className="doc-nav" aria-label="Site navigation">
+            {documents.map((d) => (
+              <button
+                key={d.id}
+                className={d.id === selectedId ? "active" : ""}
+                onClick={() => openDocument(d.id)}
+              >
+                {d.title}
+              </button>
+            ))}
+          </nav>
+        )}
         {selectedVersionId && (
           <div className="toolbar">
             <label>
