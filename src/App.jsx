@@ -355,6 +355,7 @@ export default function App() {
               <li key={a.name}>
                 {a.name}
                 <span>{a.api_url}</span>
+                {a.swagger_url && <span>swagger: {a.swagger_url}</span>}
               </li>
             ))}
           </ul>
