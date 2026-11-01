@@ -21,6 +21,13 @@ import React, { useEffect, useRef, useState } from "react";
 // Shared state is document-scoped, not version-scoped: changing
 // it never creates a version, and it survives across versions.
 //
+// Drafts: an unpublished HTML snapshot, viewable on the actual
+// viewer link (?doc=<id>&draft=1) through the same bridge as a
+// published version, and published with one click. A draft is
+// never a version, and saving one touches no published version.
+// "Open local file as draft" creates a new draft-only document
+// from a local file, so testing never clobbers a published page.
+//
 // The components below are plain React placeholders. Swap them
 // for the approved component library later; no approved library
 // name is invented or depended on here.
@@ -174,6 +181,8 @@ export default function App() {
   const [selectedId, setSelectedId] = useState(null);
   const [versions, setVersions] = useState([]);
   const [selectedVersionId, setSelectedVersionId] = useState(null);
+  const [viewingDraft, setViewingDraft] = useState(false);
+  const [hasDraft, setHasDraft] = useState(false);
   const [error, setError] = useState("");
   const [docSrc, setDocSrc] = useState("");
   const [stateEntries, setStateEntries] = useState({});
@@ -181,9 +190,18 @@ export default function App() {
   const [stateValue, setStateValue] = useState("");
   const [apis, setApis] = useState([]);
   const iframeRef = useRef(null);
+  const draftFileRef = useRef(null);
   const apisRef = useRef([]);
   const documentsRef = useRef([]);
   const tokenCacheRef = useRef(new Map());
+
+  async function refreshDocuments() {
+    const data = await api("/v1/documents");
+    const docs = data.documents || [];
+    setDocuments(docs);
+    documentsRef.current = docs;
+    return docs;
+  }
 
   useEffect(() => {
     api("/v1/documents")
@@ -192,10 +210,12 @@ export default function App() {
         setDocuments(docs);
         documentsRef.current = docs;
         // Deep-link: ?doc=<id> opens that page on load, so nav
-        // links are shareable and bookmarkable.
-        const wanted = new URLSearchParams(window.location.search).get("doc");
+        // links are shareable and bookmarkable. ?doc=<id>&draft=1
+        // opens its draft on the actual viewer link instead.
+        const params = new URLSearchParams(window.location.search);
+        const wanted = params.get("doc");
         if (wanted && docs.some((d) => d.id === wanted)) {
-          openDocument(wanted);
+          openDocument(wanted, params.get("draft") === "1");
         }
       })
       .catch((e) => setError(String(e)));
@@ -216,11 +236,14 @@ export default function App() {
     }
   }
 
-  async function openDocument(docId) {
+  async function openDocument(docId, wantDraft = false) {
     setError("");
     setSelectedId(docId);
     try {
-      window.history.replaceState(null, "", `?doc=${encodeURIComponent(docId)}`);
+      const url = wantDraft
+        ? `?doc=${encodeURIComponent(docId)}&draft=1`
+        : `?doc=${encodeURIComponent(docId)}`;
+      window.history.replaceState(null, "", url);
     } catch {
       // Non-browser / restricted contexts: URL sync is best-effort.
     }
@@ -228,14 +251,53 @@ export default function App() {
       const data = await api(`/v1/documents/${docId}/versions`);
       setVersions(data.versions || []);
       const latest = (data.versions || []).at(-1);
-      setSelectedVersionId(latest ? latest.id : null);
       await loadState(docId);
+      // A draft is rendered from the API's stored draft, through
+      // the same bridge as a published version — so the author
+      // tests on the actual viewer link, with apiFetch, kv, and
+      // navigate working, before anything is published.
+      let draft = null;
+      try {
+        draft = await api(`/v1/documents/${docId}/draft`);
+        setHasDraft(true);
+      } catch {
+        setHasDraft(false);
+      }
+      if (wantDraft && draft) {
+        setViewingDraft(true);
+        setSelectedVersionId(null);
+        setDocSrc(withBridge(draft.html));
+      } else {
+        if (wantDraft) setError("No draft for this document — showing the published version.");
+        setViewingDraft(false);
+        setSelectedVersionId(latest ? latest.id : null);
+        if (!latest) setDocSrc("");
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  // Open a local file as a draft: creates a new draft-only
+  // document (nothing is published), then opens it on the
+  // actual viewer link. Testing a local file never clobbers
+  // a published document.
+  async function openLocalFileAsDraft(file) {
+    if (!file) return;
+    setError("");
+    try {
+      const html = await file.text();
+      const title = file.name.replace(/\.html?$/i, "") || file.name;
+      const created = await apiCall("/v1/documents", "POST", { title, html, draft: true });
+      await refreshDocuments();
+      await openDocument(created.id, true);
     } catch (e) {
       setError(String(e));
     }
   }
 
   useEffect(() => {
+    if (viewingDraft) return;
     if (!selectedId || !selectedVersionId) {
       setDocSrc("");
       return;
@@ -243,7 +305,7 @@ export default function App() {
     apiText(`/v1/documents/${selectedId}/versions/${selectedVersionId}/html`)
       .then((html) => setDocSrc(withBridge(html)))
       .catch((e) => setError(String(e)));
-  }, [selectedId, selectedVersionId]);
+  }, [selectedId, selectedVersionId, viewingDraft]);
 
   // Bridge replies: document JS -> chrome -> api repo -> document JS.
   // Only messages from this viewer iframe are honoured.
@@ -382,6 +444,23 @@ export default function App() {
         <h1>agent-docs</h1>
         <p className="hint">Publish, view, version history, and shared state.</p>
         {error && <p className="error">{error}</p>}
+        <input
+          ref={draftFileRef}
+          type="file"
+          accept=".html,text/html"
+          style={{ display: "none" }}
+          onChange={(e) => {
+            openLocalFileAsDraft(e.target.files && e.target.files[0]);
+            e.target.value = "";
+          }}
+        />
+        <button onClick={() => draftFileRef.current && draftFileRef.current.click()}>
+          Open local file as draft
+        </button>
+        <p className="hint">
+          Creates a draft (nothing published) and opens it on the
+          actual viewer link, with live data and state working.
+        </p>
         <ul>
           {documents.map((d) => (
             <li key={d.id}>
@@ -390,7 +469,10 @@ export default function App() {
                 onClick={() => openDocument(d.id)}
               >
                 {d.title}
-                <span>latest v{d.latest_version}</span>
+                <span>
+                  {d.latest_version ? `latest v${d.latest_version}` : "draft only"}
+                  {d.has_draft ? " · draft" : ""}
+                </span>
               </button>
             </li>
           ))}
@@ -426,6 +508,40 @@ export default function App() {
               </button>
             ))}
           </nav>
+        )}
+        {viewingDraft && selectedId && (
+          <div className="toolbar">
+            <strong>Draft — not published</strong>
+            <span className="hint">
+              This is the actual viewer link (
+              {`?doc=${selectedId}&draft=1`}) — share it to review.
+              Nothing here is a version yet.
+            </span>{" "}
+            <button
+              onClick={async () => {
+                await apiCall(`/v1/documents/${selectedId}/draft/publish`, "POST", {});
+                await refreshDocuments();
+                await openDocument(selectedId);
+              }}
+            >
+              Publish draft
+            </button>{" "}
+            <button
+              onClick={async () => {
+                await apiCall(`/v1/documents/${selectedId}/draft`, "DELETE");
+                await refreshDocuments();
+                await openDocument(selectedId);
+              }}
+            >
+              Discard draft
+            </button>
+          </div>
+        )}
+        {!viewingDraft && selectedId && hasDraft && (
+          <div className="toolbar">
+            <span className="hint">This document has a draft.</span>{" "}
+            <button onClick={() => openDocument(selectedId, true)}>View draft</button>
+          </div>
         )}
         {selectedVersionId && (
           <div className="toolbar">
