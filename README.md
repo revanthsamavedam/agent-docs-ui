@@ -12,6 +12,7 @@ Screens:
 - Document viewer
 - Version picker (latest by default; any older version viewable)
 - Document state panel (view/set/delete shared state keys)
+- Registered APIs list (from `GET /v1/apis`)
 
 No comments, reactions, mentions, notifications, grants UI,
 or approvals UI.
@@ -25,7 +26,18 @@ the api repo's raw HTML, then renders a copy with a bridge
 script added at render time only. That bridge exposes
 `window.agentdocs.kv` (plus `window.slashdocs.kv`) to document
 JavaScript, talking to this chrome by postMessage, which calls
-the api repo's `/state` endpoints. The iframe uses
+the api repo's `/state` endpoints. The same bridge exposes
+`window.agentdocs.apiFetch(apiName, path)`: the chrome loads
+the API registry from `GET /v1/apis`, resolves the API's
+per-endpoint token URL, fetches that token with the viewer's
+sign-in (see `getViewerToken` in `src/App.jsx` — MAINTAINER:
+replace it with real Entra token acquisition before
+distributing), caches the token per API until expiry,
+refreshes once on a 401, calls the API, and returns only
+`{status, data}` to the document. Tokens never enter document
+code. An author-provided token URL is honoured only if its
+origin is in `TRUSTED_TOKEN_URL_ORIGINS` (empty in this build).
+The iframe uses
 `sandbox="allow-scripts"` only — `allow-same-origin` is
 deliberately not set, so document code cannot reach the app's
 origin. In production the API/render origin differs from this

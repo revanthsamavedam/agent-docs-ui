@@ -3,10 +3,14 @@ import React, { useEffect, useRef, useState } from "react";
 // Viewer chrome only. Document HTML is NEVER rendered by React:
 // it is loaded in a sandboxed iframe. The stored HTML is never
 // changed — the viewer only wraps it at render time with a
-// bridge script that exposes window.agentdocs.kv (and the
-// SlashDocs-compatible alias window.slashdocs.kv) via postMessage
-// to this chrome, which calls the api repo's state endpoints.
-// No dangerouslySetInnerHTML, no parsing of document HTML
+// bridge script that exposes window.agentdocs.kv and
+// window.agentdocs.apiFetch via postMessage to this chrome.
+// kv calls the api repo's state endpoints; apiFetch resolves a
+// registered internal API (or an author-provided token URL, if
+// its origin is trusted), fetches that endpoint's token with
+// the viewer's sign-in, calls the API, and returns only
+// {status, data} to the document. Tokens never enter document
+// code. No dangerouslySetInnerHTML, no parsing of document HTML
 // anywhere in this app.
 //
 // Shared state is document-scoped, not version-scoped: changing
@@ -48,6 +52,30 @@ async function apiText(path) {
   return res.text();
 }
 
+// Trusted token-URL origins, set in code by the maintainer
+// before production (empty = no origin restriction in this
+// build, for local onboarding; production should list the
+// internal domains / Entra tenant allowed here).
+const TRUSTED_TOKEN_URL_ORIGINS = [];
+
+// Viewer token source — MAINTAINER: replace this with the real
+// Entra token acquisition (e.g. MSAL acquireTokenSilent) before
+// distributing the viewer. Returning null means token-URL calls
+// are attempted without an Authorization header; token URLs
+// that need a viewer token will fail until this is wired.
+async function getViewerToken() {
+  return null;
+}
+
+function jwtExpiryMs(token) {
+  try {
+    const payload = JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+    return payload.exp ? payload.exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
 // Render-time bridge, injected into a copy of the stored HTML only.
 // The stored version stays byte-identical; this script never lands
 // in the api repo. It talks to the viewer chrome by postMessage,
@@ -74,6 +102,34 @@ const BRIDGE_SCRIPT = `
     if (d.ok) p.resolve(d.value);
     else p.reject(new Error(d.error || "kv error"));
   });
+  var apiPending = {};
+  window.addEventListener("message", function (e) {
+    var d = e.data || {};
+    if (d.type !== "agentdocs-api-response" || !apiPending[d.id]) return;
+    var p = apiPending[d.id];
+    delete apiPending[d.id];
+    if (d.ok) p.resolve({ status: d.status, data: d.data });
+    else p.reject(new Error(d.error || "api error"));
+  });
+  function apiFetch(apiRef, second) {
+    // apiFetch("reports", "/reports/q3") — registered name + path.
+    // apiFetch("https://internal-a/api/reports") — full URL, resolved via registry.
+    // apiFetch("https://internal-a/api/reports", "https://internal-a/token") — author-provided token URL.
+    return new Promise(function (resolve, reject) {
+      var id = nextId++;
+      apiPending[id] = { resolve: resolve, reject: reject };
+      var tokenUrl = null;
+      var path = second || "";
+      if (second && second.indexOf("http") === 0) {
+        tokenUrl = second;
+        path = "";
+      }
+      window.parent.postMessage(
+        { type: "agentdocs-api", id: id, apiRef: apiRef, path: path, tokenUrl: tokenUrl },
+        "*"
+      );
+    });
+  }
   var kv = {
     get: function (key) { return call("get", key); },
     all: function () { return call("all"); },
@@ -81,7 +137,7 @@ const BRIDGE_SCRIPT = `
     delete: function (key) { return call("delete", key); },
     patch: function (patch) { return call("patch", null, null, patch); },
   };
-  window.agentdocs = { kv: kv };
+  window.agentdocs = { kv: kv, apiFetch: apiFetch };
   window.slashdocs = { kv: kv };
 })();
 `;
@@ -104,12 +160,21 @@ export default function App() {
   const [stateEntries, setStateEntries] = useState({});
   const [stateKey, setStateKey] = useState("");
   const [stateValue, setStateValue] = useState("");
+  const [apis, setApis] = useState([]);
   const iframeRef = useRef(null);
+  const apisRef = useRef([]);
+  const tokenCacheRef = useRef(new Map());
 
   useEffect(() => {
     api("/v1/documents")
       .then((data) => setDocuments(data.documents || []))
       .catch((e) => setError(String(e)));
+    api("/v1/apis")
+      .then((data) => {
+        setApis(data.apis || []);
+        apisRef.current = data.apis || [];
+      })
+      .catch(() => setApis([]));
   }, []);
 
   async function loadState(docId) {
@@ -180,6 +245,85 @@ export default function App() {
     return () => window.removeEventListener("message", onMessage);
   }, [selectedId]);
 
+  // apiFetch bridge: document -> chrome -> token URL -> internal API -> document.
+  // The document never receives a token. Tokens are cached per API
+  // until expiry, refreshed once on a 401, and never stored.
+  async function fetchTokenFor(entry) {
+    const cached = tokenCacheRef.current.get(entry.name || entry.api_url);
+    if (cached && cached.exp && cached.exp > Date.now() + 60000) {
+      return cached.token;
+    }
+    const viewerToken = await getViewerToken();
+    const headers = { "Content-Type": "application/json" };
+    if (viewerToken) headers.Authorization = `Bearer ${viewerToken}`;
+    const body = entry.scope ? { scope: entry.scope } : {};
+    const res = await fetch(entry.token_url, { method: "POST", headers, body: JSON.stringify(body) });
+    if (!res.ok) throw new Error(`token fetch failed ${res.status}`);
+    const data = await res.json();
+    const token = data.access_token;
+    if (!token) throw new Error("token URL did not return an access_token");
+    const exp = jwtExpiryMs(token);
+    tokenCacheRef.current.set(entry.name || entry.api_url, { token, exp });
+    return token;
+  }
+
+  async function callRegisteredApi(apiRef, path, tokenUrlOverride) {
+    let entry = apisRef.current.find((a) => a.name === apiRef);
+    let fullUrl;
+    if (entry) {
+      const base = entry.api_url.replace(/\/$/, "");
+      fullUrl = path ? `${base}/${String(path).replace(/^\//, "")}` : base;
+    } else if (typeof apiRef === "string" && apiRef.indexOf("http") === 0) {
+      fullUrl = apiRef;
+      entry = apisRef.current.find((a) => fullUrl.indexOf(a.api_url.replace(/\/$/, "")) === 0);
+      if (!entry && tokenUrlOverride) {
+        if (TRUSTED_TOKEN_URL_ORIGINS.length > 0) {
+          const origin = new URL(tokenUrlOverride).host;
+          if (!TRUSTED_TOKEN_URL_ORIGINS.includes(origin)) {
+            throw new Error("token URL origin not trusted");
+          }
+        }
+        entry = { name: fullUrl, api_url: fullUrl, token_url: tokenUrlOverride, scope: "" };
+      }
+      if (!entry) throw new Error("api_not_registered");
+    } else {
+      throw new Error("api_not_registered");
+    }
+    async function doCall() {
+      const token = await fetchTokenFor(entry);
+      return fetch(fullUrl, { headers: { Authorization: `Bearer ${token}` } });
+    }
+    let res = await doCall();
+    if (res.status === 401) {
+      tokenCacheRef.current.delete(entry.name || entry.api_url);
+      res = await doCall();
+    }
+    let data;
+    try {
+      data = await res.json();
+    } catch {
+      data = await res.text();
+    }
+    return { status: res.status, data };
+  }
+
+  useEffect(() => {
+    async function onApiMessage(e) {
+      const frame = iframeRef.current;
+      if (!frame || e.source !== frame.contentWindow) return;
+      const d = e.data || {};
+      if (d.type !== "agentdocs-api") return;
+      try {
+        const result = await callRegisteredApi(d.apiRef, d.path, d.tokenUrl);
+        frame.contentWindow.postMessage({ type: "agentdocs-api-response", id: d.id, ok: true, status: result.status, data: result.data }, "*");
+      } catch (err) {
+        frame.contentWindow.postMessage({ type: "agentdocs-api-response", id: d.id, ok: false, error: String(err) }, "*");
+      }
+    }
+    window.addEventListener("message", onApiMessage);
+    return () => window.removeEventListener("message", onApiMessage);
+  }, []);
+
   return (
     <div className="layout">
       <aside className="sidebar">
@@ -201,6 +345,19 @@ export default function App() {
         </ul>
         {documents.length === 0 && !error && (
           <p className="hint">No documents yet. Publish one via the MCP or CLI.</p>
+        )}
+        <h2>Registered APIs</h2>
+        {apis.length === 0 ? (
+          <p className="hint">None yet. Register one via `apis register` (CLI) or `register_api` (MCP).</p>
+        ) : (
+          <ul>
+            {apis.map((a) => (
+              <li key={a.name}>
+                {a.name}
+                <span>{a.api_url}</span>
+              </li>
+            ))}
+          </ul>
         )}
       </aside>
       <main className="viewer">
