@@ -65,6 +65,18 @@ npm run dev
 # with the api repo running on http://127.0.0.1:8000
 ```
 
+## Drafts — test a local file on the actual viewer link
+
+"Open local file as draft" in the sidebar creates a new
+draft-only document from a local HTML file (nothing is
+published) and opens it at `?doc=<id>&draft=1`, through the
+same bridge as a published page — live data, state, and
+navigation all work. The draft banner on that link has
+Publish draft and Discard draft buttons, and a document with
+a draft shows a View draft button on its published view.
+A draft is never a version, and saving one touches no
+published version.
+
 ## Build
 
 ```
