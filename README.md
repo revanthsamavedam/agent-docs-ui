@@ -27,15 +27,19 @@ script added at render time only. That bridge exposes
 `window.agentdocs.kv` (plus `window.slashdocs.kv`) to document
 JavaScript, talking to this chrome by postMessage, which calls
 the api repo's `/state` endpoints. The same bridge exposes
-`window.agentdocs.apiFetch(apiName, path)`: the chrome loads
+`window.agentdocs.apiFetch(apiName, path, options?)`: the chrome loads
 the API registry from `GET /v1/apis`, resolves the API's
 per-endpoint token URL, fetches that token with the viewer's
 sign-in (see `getViewerToken` in `src/App.jsx` — MAINTAINER:
 replace it with real Entra token acquisition before
 distributing), caches the token per API until expiry,
-refreshes once on a 401, calls the API, and returns only
+calls the API, and returns only
 `{status, data}` to the document. Tokens never enter document
-code. An author-provided token URL is honoured only if its
+code. Methods: GET (default), POST, PUT, DELETE — e.g.
+`apiFetch("refdp", "/reports", { method: "POST", body: { status: "open" } })`.
+A GET with a body is rejected; a 401 is retried once for
+idempotent methods only, never automatically for POST (a blind
+retry could duplicate a creation). An author-provided token URL is honoured only if its
 origin is in `TRUSTED_TOKEN_URL_ORIGINS` (empty in this build).
 The iframe uses
 `sandbox="allow-scripts"` only — `allow-same-origin` is

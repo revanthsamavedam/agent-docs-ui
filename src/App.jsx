@@ -15,8 +15,11 @@ import React, { useEffect, useRef, useState } from "react";
 // its origin is trusted), fetches that endpoint's token with
 // the viewer's sign-in, calls the API, and returns only
 // {status, data} to the document. Tokens never enter document
-// code. No dangerouslySetInnerHTML, no parsing of document HTML
-// anywhere in this app.
+// code. apiFetch supports GET (default), POST, PUT, and DELETE;
+// a GET with a body is rejected, and a POST is not auto-retried
+// on 401 (a blind retry could duplicate a creation). No
+// dangerouslySetInnerHTML, no parsing of document HTML anywhere
+// in this app.
 //
 // Shared state is document-scoped, not version-scoped: changing
 // it never creates a version, and it survives across versions.
@@ -123,21 +126,32 @@ const BRIDGE_SCRIPT = `
     if (d.ok) p.resolve({ status: d.status, data: d.data });
     else p.reject(new Error(d.error || "api error"));
   });
-  function apiFetch(apiRef, second) {
-    // apiFetch("reports", "/reports/q3") — registered name + path.
-    // apiFetch("https://internal-a/api/reports") — full URL, resolved via registry.
-    // apiFetch("https://internal-a/api/reports", "https://internal-a/token") — author-provided token URL.
+  function apiFetch(apiRef, second, third) {
+    // apiFetch("reports", "/reports/q3") — GET, registered name + path.
+    // apiFetch("https://internal-a/api/reports") — GET, full URL, resolved via registry.
+    // apiFetch("https://internal-a/api/reports", "https://internal-a/token") — GET, author-provided token URL.
+    // apiFetch("reports", "/reports", { method: "POST", body: { status: "open" } }) — POST/PUT/DELETE.
+    // apiFetch("reports", { method: "DELETE" }) — options as the second argument (path defaults to "").
+    // The document never sees a token and never sets Authorization:
+    // the viewer chrome adds the token and owns the call. A GET
+    // with a body is rejected by the chrome, not sent.
     return new Promise(function (resolve, reject) {
       var id = nextId++;
       apiPending[id] = { resolve: resolve, reject: reject };
       var tokenUrl = null;
-      var path = second || "";
-      if (second && second.indexOf("http") === 0) {
+      var path = "";
+      var options = null;
+      if (second && typeof second === "object") {
+        options = second;
+      } else if (second && second.indexOf("http") === 0) {
         tokenUrl = second;
-        path = "";
+      } else {
+        path = second || "";
       }
+      if (third) options = third;
       window.parent.postMessage(
-        { type: "agentdocs-api", id: id, apiRef: apiRef, path: path, tokenUrl: tokenUrl },
+        { type: "agentdocs-api", id: id, apiRef: apiRef, path: path, tokenUrl: tokenUrl,
+          method: options ? options.method : null, body: options ? options.body : null },
         "*"
       );
     });
@@ -364,7 +378,20 @@ export default function App() {
     return token;
   }
 
-  async function callRegisteredApi(apiRef, path, tokenUrlOverride) {
+  // Methods the bridge supports. GET is the default. POST/PUT/
+  // DELETE go through the same registry lookup, token fetch, and
+  // trusted-origin checks as GET — the document still never sees
+  // a token and cannot set Authorization (the chrome sets it).
+  const API_METHODS = ["GET", "POST", "PUT", "DELETE"];
+
+  async function callRegisteredApi(apiRef, path, tokenUrlOverride, options) {
+    const method = (options?.method || "GET").toUpperCase();
+    if (!API_METHODS.includes(method)) {
+      throw new Error("unsupported_method");
+    }
+    if (method === "GET" && options?.body !== undefined && options?.body !== null) {
+      throw new Error("get_with_body_not_allowed");
+    }
     let entry = apisRef.current.find((a) => a.name === apiRef);
     let fullUrl;
     if (entry) {
@@ -388,10 +415,21 @@ export default function App() {
     }
     async function doCall() {
       const token = await fetchTokenFor(entry);
-      return fetch(fullUrl, { headers: { Authorization: `Bearer ${token}` } });
+      const headers = { Authorization: `Bearer ${token}` };
+      const init = { method, headers };
+      if (options?.body !== undefined && options?.body !== null) {
+        headers["Content-Type"] = "application/json";
+        init.body = typeof options.body === "string" ? options.body : JSON.stringify(options.body);
+      }
+      return fetch(fullUrl, init);
     }
     let res = await doCall();
-    if (res.status === 401) {
+    // 401 retry, once — but only for idempotent methods. A POST
+    // is not retried automatically: if the first attempt was
+    // actually applied, a blind retry could create a duplicate.
+    // A POST that returns 401 is returned to the document, which
+    // can retry explicitly if it knows the call is safe to repeat.
+    if (res.status === 401 && method !== "POST") {
       tokenCacheRef.current.delete(entry.name || entry.api_url);
       res = await doCall();
     }
@@ -428,7 +466,7 @@ export default function App() {
       const d = e.data || {};
       if (d.type !== "agentdocs-api") return;
       try {
-        const result = await callRegisteredApi(d.apiRef, d.path, d.tokenUrl);
+        const result = await callRegisteredApi(d.apiRef, d.path, d.tokenUrl, { method: d.method, body: d.body });
         frame.contentWindow.postMessage({ type: "agentdocs-api-response", id: d.id, ok: true, status: result.status, data: result.data }, "*");
       } catch (err) {
         frame.contentWindow.postMessage({ type: "agentdocs-api-response", id: d.id, ok: false, error: String(err) }, "*");
