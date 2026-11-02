@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
+import { createUsageBeacon } from "./usageBeacon.js";
 
 // Viewer chrome only. Document HTML is NEVER rendered by React:
 // it is loaded in a sandboxed iframe. The stored HTML is never
@@ -9,11 +10,11 @@ import React, { useEffect, useRef, useState } from "react";
 // renders a nav bar over the document list, documents link
 // to each other with window.agentdocs.navigate(docId) or
 // <a data-agentdocs-doc="doc_...">, and ?doc=<id> deep-links
-// a page. State stays document-scoped across navigation.
+// a page, with an optional ?version=N pinning one version.
+// State stays document-scoped across navigation.
 // kv calls the api repo's state endpoints; apiFetch resolves a
-// registered internal API (or an author-provided token URL, if
-// its origin is trusted), fetches that endpoint's token with
-// the viewer's sign-in, calls the API, and returns only
+// registered internal API by app_name, fetches that API's token
+// with the viewer's sign-in, calls the API, and returns only
 // {status, data} to the document. Tokens never enter document
 // code. apiFetch supports GET (default), POST, PUT, and DELETE;
 // a GET with a body is rejected, and a POST is not auto-retried
@@ -21,15 +22,21 @@ import React, { useEffect, useRef, useState } from "react";
 // dangerouslySetInnerHTML, no parsing of document HTML anywhere
 // in this app.
 //
+// Versions: a document's versions are numbered 1, 2, 3, ... and
+// immutable. ?doc=<id> with no version shows the LATEST
+// version. ?doc=<id>&version=N shows exactly version N; if
+// that version does not exist the viewer shows a not-found
+// error and NEVER silently falls back to latest, so a pinned
+// link can never show different content than it promises.
+//
+// Usage beacon: after every apiFetch settles (success or
+// failure), the chrome queues a usage event and flushes it to
+// POST /v1/usage (see usageBeacon.js). The beacon carries no
+// query strings, bodies, headers, or tokens, and a beacon
+// failure never breaks the document or the call.
+//
 // Shared state is document-scoped, not version-scoped: changing
 // it never creates a version, and it survives across versions.
-//
-// Drafts: an unpublished HTML snapshot, viewable on the actual
-// viewer link (?doc=<id>&draft=1) through the same bridge as a
-// published version, and published with one click. A draft is
-// never a version, and saving one touches no published version.
-// "Open local file as draft" creates a new draft-only document
-// from a local file, so testing never clobbers a published page.
 //
 // The components below are plain React placeholders. Swap them
 // for the approved component library later; no approved library
@@ -39,8 +46,33 @@ const API = (import.meta.env.VITE_API_URL || "http://127.0.0.1:8000").replace(
   ""
 );
 
+// Viewer token source — MAINTAINER: replace this with the real
+// Entra token acquisition (e.g. MSAL acquireTokenSilent) before
+// distributing the viewer. Returning null means api-repo calls
+// are attempted without an Authorization header; the server
+// then records the actor as anonymous. Token-URL calls that
+// need a viewer token will fail until this is wired.
+async function getViewerToken() {
+  return null;
+}
+
+// Auth headers shared by every bridge call to the api repo,
+// including the usage beacon: the server derives the actor
+// from this header, never from a client-supplied field.
+async function viewerHeaders() {
+  let token = null;
+  try {
+    token = await getViewerToken();
+  } catch {
+    token = null;
+  }
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 async function api(path) {
-  const res = await fetch(`${API}${path}`);
+  const res = await fetch(`${API}${path}`, {
+    headers: await viewerHeaders(),
+  });
   if (!res.ok) {
     throw new Error(`${res.status} ${path}`);
   }
@@ -50,7 +82,7 @@ async function api(path) {
 async function apiCall(path, method, body) {
   const res = await fetch(`${API}${path}`, {
     method,
-    headers: { "Content-Type": "application/json" },
+    headers: { ...(await viewerHeaders()), "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!res.ok) {
@@ -60,7 +92,9 @@ async function apiCall(path, method, body) {
 }
 
 async function apiText(path) {
-  const res = await fetch(`${API}${path}`);
+  const res = await fetch(`${API}${path}`, {
+    headers: await viewerHeaders(),
+  });
   if (!res.ok) {
     throw new Error(`${res.status} ${path}`);
   }
@@ -72,15 +106,6 @@ async function apiText(path) {
 // build, for local onboarding; production should list the
 // internal domains / Entra tenant allowed here).
 const TRUSTED_TOKEN_URL_ORIGINS = [];
-
-// Viewer token source — MAINTAINER: replace this with the real
-// Entra token acquisition (e.g. MSAL acquireTokenSilent) before
-// distributing the viewer. Returning null means token-URL calls
-// are attempted without an Authorization header; token URLs
-// that need a viewer token will fail until this is wired.
-async function getViewerToken() {
-  return null;
-}
 
 function jwtExpiryMs(token) {
   try {
@@ -127,7 +152,7 @@ const BRIDGE_SCRIPT = `
     else p.reject(new Error(d.error || "api error"));
   });
   function apiFetch(apiRef, second, third) {
-    // apiFetch("reports", "/reports/q3") — GET, registered name + path.
+    // apiFetch("reports", "/reports/q3") — GET, registered app_name + path.
     // apiFetch("https://internal-a/api/reports") — GET, full URL, resolved via registry.
     // apiFetch("https://internal-a/api/reports", "https://internal-a/token") — GET, author-provided token URL.
     // apiFetch("reports", "/reports", { method: "POST", body: { status: "open" } }) — POST/PUT/DELETE.
@@ -190,13 +215,18 @@ function withBridge(html) {
   return html + script;
 }
 
+function nowMs() {
+  if (typeof performance !== "undefined" && performance.now) {
+    return performance.now();
+  }
+  return Date.now();
+}
+
 export default function App() {
   const [documents, setDocuments] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
   const [versions, setVersions] = useState([]);
-  const [selectedVersionId, setSelectedVersionId] = useState(null);
-  const [viewingDraft, setViewingDraft] = useState(false);
-  const [hasDraft, setHasDraft] = useState(false);
+  const [selectedVersionNo, setSelectedVersionNo] = useState(null);
   const [error, setError] = useState("");
   const [docSrc, setDocSrc] = useState("");
   const [stateEntries, setStateEntries] = useState({});
@@ -204,10 +234,26 @@ export default function App() {
   const [stateValue, setStateValue] = useState("");
   const [apis, setApis] = useState([]);
   const iframeRef = useRef(null);
-  const draftFileRef = useRef(null);
   const apisRef = useRef([]);
   const documentsRef = useRef([]);
   const tokenCacheRef = useRef(new Map());
+  // Refs (not state) for the beacon: apiFetch handlers are
+  // registered once, so they must read the document/version
+  // that made the call, not a stale closure.
+  const selectedIdRef = useRef(null);
+  const selectedVersionNoRef = useRef(null);
+  const beaconRef = useRef(null);
+  if (beaconRef.current === null) {
+    beaconRef.current = createUsageBeacon({
+      apiBase: API,
+      getHeaders: viewerHeaders,
+      sendBeaconImpl:
+        typeof navigator !== "undefined" && navigator.sendBeacon
+          ? navigator.sendBeacon.bind(navigator)
+          : null,
+      fetchImpl: typeof fetch !== "undefined" ? fetch.bind(window) : null,
+    });
+  }
 
   async function refreshDocuments() {
     const data = await api("/v1/documents");
@@ -217,6 +263,27 @@ export default function App() {
     return docs;
   }
 
+  // Beacon flush on a timer, on page hide, and on unload-path
+  // visibility loss. A failed flush is dropped by the beacon
+  // itself; nothing here can throw into the document.
+  useEffect(() => {
+    const beacon = beaconRef.current;
+    beacon.start();
+    const flush = () => {
+      void beacon.flush();
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") flush();
+    };
+    window.addEventListener("pagehide", flush);
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      document.removeEventListener("visibilitychange", onVisibility);
+      beacon.stop();
+    };
+  }, []);
+
   useEffect(() => {
     api("/v1/documents")
       .then((data) => {
@@ -224,12 +291,22 @@ export default function App() {
         setDocuments(docs);
         documentsRef.current = docs;
         // Deep-link: ?doc=<id> opens that page on load, so nav
-        // links are shareable and bookmarkable. ?doc=<id>&draft=1
-        // opens its draft on the actual viewer link instead.
+        // links are shareable and bookmarkable. ?doc=<id>&version=N
+        // pins exactly version N; a missing or invalid version
+        // is an error, never a silent fall back to latest.
         const params = new URLSearchParams(window.location.search);
         const wanted = params.get("doc");
         if (wanted && docs.some((d) => d.id === wanted)) {
-          openDocument(wanted, params.get("draft") === "1");
+          if (params.has("version")) {
+            const n = Number(params.get("version"));
+            if (!Number.isInteger(n) || n < 1) {
+              setError("Invalid version in link.");
+            } else {
+              openDocument(wanted, n);
+            }
+          } else {
+            openDocument(wanted);
+          }
         }
       })
       .catch((e) => setError(String(e)));
@@ -250,76 +327,66 @@ export default function App() {
     }
   }
 
-  async function openDocument(docId, wantDraft = false) {
+  async function openDocument(docId, versionNo = null) {
     setError("");
     setSelectedId(docId);
+    selectedIdRef.current = docId;
     try {
-      const url = wantDraft
-        ? `?doc=${encodeURIComponent(docId)}&draft=1`
-        : `?doc=${encodeURIComponent(docId)}`;
+      const url =
+        versionNo === null
+          ? `?doc=${encodeURIComponent(docId)}`
+          : `?doc=${encodeURIComponent(docId)}&version=${versionNo}`;
       window.history.replaceState(null, "", url);
     } catch {
       // Non-browser / restricted contexts: URL sync is best-effort.
     }
     try {
       const data = await api(`/v1/documents/${docId}/versions`);
-      setVersions(data.versions || []);
-      const latest = (data.versions || []).at(-1);
+      const list = data.versions || [];
+      setVersions(list);
       await loadState(docId);
-      // A draft is rendered from the API's stored draft, through
-      // the same bridge as a published version — so the author
-      // tests on the actual viewer link, with apiFetch, kv, and
-      // navigate working, before anything is published.
-      let draft = null;
-      try {
-        draft = await api(`/v1/documents/${docId}/draft`);
-        setHasDraft(true);
-      } catch {
-        setHasDraft(false);
-      }
-      if (wantDraft && draft) {
-        setViewingDraft(true);
-        setSelectedVersionId(null);
-        setDocSrc(withBridge(draft.html));
+      if (versionNo === null) {
+        const latest = list.at(-1);
+        if (!latest) {
+          setSelectedVersionNo(null);
+          selectedVersionNoRef.current = null;
+          setDocSrc("");
+          return;
+        }
+        setSelectedVersionNo(latest.number);
+        selectedVersionNoRef.current = latest.number;
       } else {
-        if (wantDraft) setError("No draft for this document — showing the published version.");
-        setViewingDraft(false);
-        setSelectedVersionId(latest ? latest.id : null);
-        if (!latest) setDocSrc("");
+        const wanted = list.find((v) => v.number === versionNo);
+        if (!wanted) {
+          // Explicit version requested but missing: never fall
+          // back to latest — a pinned link must not show
+          // different content than it promises.
+          setSelectedVersionNo(null);
+          selectedVersionNoRef.current = null;
+          setDocSrc("");
+          setError(`Version ${versionNo} not found for this document.`);
+          return;
+        }
+        setSelectedVersionNo(wanted.number);
+        selectedVersionNoRef.current = wanted.number;
       }
     } catch (e) {
-      setError(String(e));
-    }
-  }
-
-  // Open a local file as a draft: creates a new draft-only
-  // document (nothing is published), then opens it on the
-  // actual viewer link. Testing a local file never clobbers
-  // a published document.
-  async function openLocalFileAsDraft(file) {
-    if (!file) return;
-    setError("");
-    try {
-      const html = await file.text();
-      const title = file.name.replace(/\.html?$/i, "") || file.name;
-      const created = await apiCall("/v1/documents", "POST", { title, html, draft: true });
-      await refreshDocuments();
-      await openDocument(created.id, true);
-    } catch (e) {
+      setVersions([]);
+      setSelectedVersionNo(null);
+      selectedVersionNoRef.current = null;
       setError(String(e));
     }
   }
 
   useEffect(() => {
-    if (viewingDraft) return;
-    if (!selectedId || !selectedVersionId) {
+    if (!selectedId || selectedVersionNo === null || selectedVersionNo === undefined) {
       setDocSrc("");
       return;
     }
-    apiText(`/v1/documents/${selectedId}/versions/${selectedVersionId}/html`)
+    apiText(`/v1/documents/${selectedId}/versions/${selectedVersionNo}/html`)
       .then((html) => setDocSrc(withBridge(html)))
       .catch((e) => setError(String(e)));
-  }, [selectedId, selectedVersionId, viewingDraft]);
+  }, [selectedId, selectedVersionNo]);
 
   // Bridge replies: document JS -> chrome -> api repo -> document JS.
   // Only messages from this viewer iframe are honoured.
@@ -359,22 +426,24 @@ export default function App() {
   // apiFetch bridge: document -> chrome -> token URL -> internal API -> document.
   // The document never receives a token. Tokens are cached per API
   // until expiry, refreshed once on a 401, and never stored.
+  // A token_url of null on a registry entry means no token fetch
+  // (apiKey/bearer schemes): the call goes out without
+  // Authorization instead of failing.
   async function fetchTokenFor(entry) {
-    const cached = tokenCacheRef.current.get(entry.name || entry.api_url);
+    const cached = tokenCacheRef.current.get(entry.app_name || entry.base_url);
     if (cached && cached.exp && cached.exp > Date.now() + 60000) {
       return cached.token;
     }
     const viewerToken = await getViewerToken();
     const headers = { "Content-Type": "application/json" };
     if (viewerToken) headers.Authorization = `Bearer ${viewerToken}`;
-    const body = entry.scope ? { scope: entry.scope } : {};
-    const res = await fetch(entry.token_url, { method: "POST", headers, body: JSON.stringify(body) });
+    const res = await fetch(entry.token_url, { method: "POST", headers, body: JSON.stringify({}) });
     if (!res.ok) throw new Error(`token fetch failed ${res.status}`);
     const data = await res.json();
     const token = data.access_token;
     if (!token) throw new Error("token URL did not return an access_token");
     const exp = jwtExpiryMs(token);
-    tokenCacheRef.current.set(entry.name || entry.api_url, { token, exp });
+    tokenCacheRef.current.set(entry.app_name || entry.base_url, { token, exp });
     return token;
   }
 
@@ -384,38 +453,65 @@ export default function App() {
   // a token and cannot set Authorization (the chrome sets it).
   const API_METHODS = ["GET", "POST", "PUT", "DELETE"];
 
+  function beaconError(err) {
+    const msg = err && err.message ? err.message : String(err);
+    if (msg === "api_not_registered") return "unregistered_app";
+    if (msg === "unsupported_method") return "unsupported_method";
+    if (msg === "get_with_body_not_allowed") return "get_with_body_not_allowed";
+    if (msg === "token URL origin not trusted") return "token_url_origin_not_trusted";
+    if (msg.startsWith("token fetch failed")) return "token_fetch_failed";
+    if (msg === "token URL did not return an access_token") return "token_fetch_failed";
+    if (err instanceof TypeError) return "network_error";
+    return "call_failed";
+  }
+
   async function callRegisteredApi(apiRef, path, tokenUrlOverride, options) {
     const method = (options?.method || "GET").toUpperCase();
+    const fail = (message, appName, beaconPath) => {
+      const err = new Error(message);
+      err.beaconAppName = appName;
+      err.beaconPath = beaconPath;
+      throw err;
+    };
     if (!API_METHODS.includes(method)) {
-      throw new Error("unsupported_method");
+      fail("unsupported_method", typeof apiRef === "string" ? apiRef : "", path || "");
     }
     if (method === "GET" && options?.body !== undefined && options?.body !== null) {
-      throw new Error("get_with_body_not_allowed");
+      fail("get_with_body_not_allowed", typeof apiRef === "string" ? apiRef : "", path || "");
     }
-    let entry = apisRef.current.find((a) => a.name === apiRef);
+    let entry = apisRef.current.find((a) => a.app_name === apiRef);
     let fullUrl;
+    let beaconPath = path || "";
     if (entry) {
-      const base = entry.api_url.replace(/\/$/, "");
+      const base = entry.base_url.replace(/\/$/, "");
       fullUrl = path ? `${base}/${String(path).replace(/^\//, "")}` : base;
     } else if (typeof apiRef === "string" && apiRef.indexOf("http") === 0) {
       fullUrl = apiRef;
-      entry = apisRef.current.find((a) => fullUrl.indexOf(a.api_url.replace(/\/$/, "")) === 0);
+      try {
+        beaconPath = new URL(fullUrl).pathname;
+      } catch {
+        beaconPath = "";
+      }
+      entry = apisRef.current.find((a) => fullUrl.indexOf(a.base_url.replace(/\/$/, "")) === 0);
       if (!entry && tokenUrlOverride) {
         if (TRUSTED_TOKEN_URL_ORIGINS.length > 0) {
           const origin = new URL(tokenUrlOverride).host;
           if (!TRUSTED_TOKEN_URL_ORIGINS.includes(origin)) {
-            throw new Error("token URL origin not trusted");
+            fail("token URL origin not trusted", fullUrl, beaconPath);
           }
         }
-        entry = { name: fullUrl, api_url: fullUrl, token_url: tokenUrlOverride, scope: "" };
+        entry = { app_name: fullUrl, base_url: fullUrl, token_url: tokenUrlOverride };
       }
-      if (!entry) throw new Error("api_not_registered");
+      if (!entry) fail("api_not_registered", fullUrl, beaconPath);
     } else {
-      throw new Error("api_not_registered");
+      fail("api_not_registered", typeof apiRef === "string" ? apiRef : "", path || "");
     }
+    const beaconAppName = entry.app_name;
     async function doCall() {
-      const token = await fetchTokenFor(entry);
-      const headers = { Authorization: `Bearer ${token}` };
+      // Null token_url = no token fetch: call without Authorization.
+      const token = entry.token_url ? await fetchTokenFor(entry) : null;
+      const headers = {};
+      if (token) headers.Authorization = `Bearer ${token}`;
       const init = { method, headers };
       if (options?.body !== undefined && options?.body !== null) {
         headers["Content-Type"] = "application/json";
@@ -423,28 +519,36 @@ export default function App() {
       }
       return fetch(fullUrl, init);
     }
-    let res = await doCall();
-    // 401 retry, once — but only for idempotent methods. A POST
-    // is not retried automatically: if the first attempt was
-    // actually applied, a blind retry could create a duplicate.
-    // A POST that returns 401 is returned to the document, which
-    // can retry explicitly if it knows the call is safe to repeat.
-    if (res.status === 401 && method !== "POST") {
-      tokenCacheRef.current.delete(entry.name || entry.api_url);
-      res = await doCall();
-    }
-    let data;
     try {
-      data = await res.json();
-    } catch {
-      data = await res.text();
+      let res = await doCall();
+      // 401 retry, once — but only for idempotent methods and only
+      // when a token was actually fetched. A POST is not retried
+      // automatically: if the first attempt was actually applied,
+      // a blind retry could create a duplicate. A POST that
+      // returns 401 is returned to the document, which can retry
+      // explicitly if it knows the call is safe to repeat.
+      if (res.status === 401 && method !== "POST" && entry.token_url) {
+        tokenCacheRef.current.delete(entry.app_name || entry.base_url);
+        res = await doCall();
+      }
+      let data;
+      try {
+        data = await res.json();
+      } catch {
+        data = await res.text();
+      }
+      return { status: res.status, data, beaconAppName, beaconPath };
+    } catch (e) {
+      if (e.beaconAppName === undefined) e.beaconAppName = beaconAppName;
+      if (e.beaconPath === undefined) e.beaconPath = beaconPath;
+      throw e;
     }
-    return { status: res.status, data };
   }
 
   // Navigate bridge: document -> chrome -> switch document.
   // Only a document id already in the viewer's list is honoured;
   // an unknown id is ignored, never fetched blindly.
+  // Navigation always opens the LATEST version (no version pin).
   useEffect(() => {
     function onNavigateMessage(e) {
       const frame = iframeRef.current;
@@ -465,11 +569,43 @@ export default function App() {
       if (!frame || e.source !== frame.contentWindow) return;
       const d = e.data || {};
       if (d.type !== "agentdocs-api") return;
+      // Attribute the call to the document/version that made it,
+      // captured here — not at settle time, when the user may
+      // already have navigated elsewhere.
+      const docId = selectedIdRef.current;
+      const versionNo = selectedVersionNoRef.current;
+      const method = (d.method || "GET").toUpperCase();
+      const start = nowMs();
+      const beacon = beaconRef.current;
+      const report = (fields) => {
+        // No document selected (should not happen for an iframe
+        // call) means no attribution: skip rather than log junk.
+        if (!docId || !beacon) return;
+        beacon.enqueue({
+          document_id: docId,
+          version_no: versionNo,
+          method,
+          duration_ms: Math.round(nowMs() - start),
+          ...fields,
+        });
+      };
       try {
         const result = await callRegisteredApi(d.apiRef, d.path, d.tokenUrl, { method: d.method, body: d.body });
         frame.contentWindow.postMessage({ type: "agentdocs-api-response", id: d.id, ok: true, status: result.status, data: result.data }, "*");
+        report({
+          app_name: result.beaconAppName,
+          path: result.beaconPath,
+          status_code: result.status,
+          error: null,
+        });
       } catch (err) {
         frame.contentWindow.postMessage({ type: "agentdocs-api-response", id: d.id, ok: false, error: String(err) }, "*");
+        report({
+          app_name: err.beaconAppName || (typeof d.apiRef === "string" ? d.apiRef : ""),
+          path: err.beaconPath || d.path || "",
+          status_code: null,
+          error: beaconError(err),
+        });
       }
     }
     window.addEventListener("message", onApiMessage);
@@ -482,23 +618,6 @@ export default function App() {
         <h1>agent-docs</h1>
         <p className="hint">Publish, view, version history, and shared state.</p>
         {error && <p className="error">{error}</p>}
-        <input
-          ref={draftFileRef}
-          type="file"
-          accept=".html,text/html"
-          style={{ display: "none" }}
-          onChange={(e) => {
-            openLocalFileAsDraft(e.target.files && e.target.files[0]);
-            e.target.value = "";
-          }}
-        />
-        <button onClick={() => draftFileRef.current && draftFileRef.current.click()}>
-          Open local file as draft
-        </button>
-        <p className="hint">
-          Creates a draft (nothing published) and opens it on the
-          actual viewer link, with live data and state working.
-        </p>
         <ul>
           {documents.map((d) => (
             <li key={d.id}>
@@ -508,8 +627,7 @@ export default function App() {
               >
                 {d.title}
                 <span>
-                  {d.latest_version ? `latest v${d.latest_version}` : "draft only"}
-                  {d.has_draft ? " · draft" : ""}
+                  {d.latest_version ? `latest v${d.latest_version}` : "no versions yet"}
                 </span>
               </button>
             </li>
@@ -524,9 +642,9 @@ export default function App() {
         ) : (
           <ul>
             {apis.map((a) => (
-              <li key={a.name}>
-                {a.name}
-                <span>{a.api_url}</span>
+              <li key={a.app_name}>
+                {a.app_name}
+                <span>{a.base_url}</span>
                 {a.swagger_url && <span>swagger: {a.swagger_url}</span>}
               </li>
             ))}
@@ -547,57 +665,24 @@ export default function App() {
             ))}
           </nav>
         )}
-        {viewingDraft && selectedId && (
-          <div className="toolbar">
-            <strong>Draft — not published</strong>
-            <span className="hint">
-              This is the actual viewer link (
-              {`?doc=${selectedId}&draft=1`}) — share it to review.
-              Nothing here is a version yet.
-            </span>{" "}
-            <button
-              onClick={async () => {
-                await apiCall(`/v1/documents/${selectedId}/draft/publish`, "POST", {});
-                await refreshDocuments();
-                await openDocument(selectedId);
-              }}
-            >
-              Publish draft
-            </button>{" "}
-            <button
-              onClick={async () => {
-                await apiCall(`/v1/documents/${selectedId}/draft`, "DELETE");
-                await refreshDocuments();
-                await openDocument(selectedId);
-              }}
-            >
-              Discard draft
-            </button>
-          </div>
-        )}
-        {!viewingDraft && selectedId && hasDraft && (
-          <div className="toolbar">
-            <span className="hint">This document has a draft.</span>{" "}
-            <button onClick={() => openDocument(selectedId, true)}>View draft</button>
-          </div>
-        )}
-        {selectedVersionId && (
+        {selectedVersionNo !== null && selectedVersionNo !== undefined && (
           <div className="toolbar">
             <label>
               Version{" "}
               <select
-                value={selectedVersionId}
-                onChange={(e) => setSelectedVersionId(e.target.value)}
+                value={selectedVersionNo}
+                onChange={(e) => openDocument(selectedId, Number(e.target.value))}
               >
                 {versions.map((v) => (
-                  <option key={v.id} value={v.id}>
-                    v{v.number} — {v.change_summary || "(no summary)"}
+                  <option key={v.number} value={v.number}>
+                    v{v.number} — {v.created_at || ""}
                   </option>
                 ))}
               </select>
             </label>
             <span className="hint">
               Latest is the default; any older version is viewable.
+              A ?version=N link pins that version exactly.
             </span>
           </div>
         )}

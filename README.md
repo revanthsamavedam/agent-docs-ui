@@ -28,11 +28,14 @@ script added at render time only. That bridge exposes
 JavaScript, talking to this chrome by postMessage, which calls
 the api repo's `/state` endpoints. The same bridge exposes
 `window.agentdocs.apiFetch(apiName, path, options?)`: the chrome loads
-the API registry from `GET /v1/apis`, resolves the API's
-per-endpoint token URL, fetches that token with the viewer's
-sign-in (see `getViewerToken` in `src/App.jsx` — MAINTAINER:
-replace it with real Entra token acquisition before
-distributing), caches the token per API until expiry,
+the API registry from `GET /v1/apis`, resolves the app by
+`app_name`, fetches that app's token with the viewer's
+sign-in when the app has a `token_url` (a null `token_url`
+means no token fetch — apiKey/bearer schemes — and the call
+goes out without Authorization; see `getViewerToken` in
+`src/App.jsx` — MAINTAINER: replace it with real Entra token
+acquisition before distributing), caches the token per API
+until expiry,
 calls the API, and returns only
 `{status, data}` to the document. Tokens never enter document
 code. Methods: GET (default), POST, PUT, DELETE — e.g.
@@ -69,17 +72,32 @@ npm run dev
 # with the api repo running on http://127.0.0.1:8000
 ```
 
-## Drafts — test a local file on the actual viewer link
+## Versions — latest by default, ?version=N pins one
 
-"Open local file as draft" in the sidebar creates a new
-draft-only document from a local HTML file (nothing is
-published) and opens it at `?doc=<id>&draft=1`, through the
-same bridge as a published page — live data, state, and
-navigation all work. The draft banner on that link has
-Publish draft and Discard draft buttons, and a document with
-a draft shows a View draft button on its published view.
-A draft is never a version, and saving one touches no
-published version.
+`?doc=<id>` with no version shows the latest version.
+`?doc=<id>&version=N` shows exactly version N; if that
+version does not exist the viewer shows a not-found error
+and never silently falls back to latest, so a pinned link
+can never show different content than it promises. The
+version picker lists every version; picking one pins it in
+the URL. Navigation between documents (nav bar,
+`navigate(docId)`, `data-agentdocs-doc` links) always opens
+the latest version. Version HTML always comes from the api
+repo — the viewer never talks to S3 and never sees a
+bucket URL.
+
+## Usage beacon — what live data a document touched
+
+After every apiFetch settles (success or failure), the
+viewer chrome queues a usage event and flushes it to
+`POST /v1/usage` (fetch keepalive, sendBeacon fallback; see
+`src/usageBeacon.js`). Each event carries document_id, the
+resolved version_no, app_name, method, path with any query
+string stripped, status_code (null when no response
+arrived), error, and duration_ms. The actor is derived
+server-side from the viewer token. The beacon never carries
+query strings, request/response bodies, headers, or tokens,
+and a beacon failure never breaks the document or the call.
 
 ## Build
 
